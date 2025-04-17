@@ -1,0 +1,12 @@
+{
+    "server_host": "0.0.0.0",
+    "server_port": "3788",
+    "file_dir": "./files",
+    "user_file": "./users.json",
+    "storage_mode": "json",
+    "db_host": "localhost",
+    "db_port": "5432",
+    "db_user": "postgres",
+    "db_password": "123",
+    "db_name": "postgredb"
+}
