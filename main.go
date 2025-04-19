@@ -48,6 +48,8 @@ type UserStore interface {
 	LoadUsers() error
 	ValidateCredentials(username, password string) bool
 	AddUser(username, password string) error
+	GetUser(username string) (User, bool)
+	IsAdmin(username string) bool
 }
 
 type JSONUserStore struct {
@@ -165,6 +167,45 @@ func (store *PostgresUserStore) AddUser(username, password string) error {
 	return err
 }
 
+func (store *JSONUserStore) GetUser(username string) (User, bool) {
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+
+	for _, user := range store.Users {
+		if user.Username == username {
+			return user, true
+		}
+	}
+	return User{}, false
+}
+
+func (store *PostgresUserStore) GetUser(username string) (User, bool) {
+	var user User
+	err := db.QueryRow("SELECT username, password, is_admin FROM users WHERE username = $1", username).Scan(&user.Username, &user.Password, &user.IsAdmin)
+	return user, err == nil
+}
+
+func (store *JSONUserStore) IsAdmin(username string) bool {
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+
+	for _, user := range store.Users {
+		if user.Username == username {
+			return user.IsAdmin
+		}
+	}
+	return false
+}
+
+func (store *PostgresUserStore) IsAdmin(username string) bool {
+	var isAdmin bool
+	err := db.QueryRow("SELECT is_admin FROM users WHERE username = $1", username).Scan(&isAdmin)
+	if err != nil {
+		return false
+	}
+	return isAdmin
+}
+
 func main() {
 	// Load config
 	configFile, err := os.Open("config.json")
@@ -175,6 +216,12 @@ func main() {
 
 	if err := json.NewDecoder(configFile).Decode(&config); err != nil {
 		log.Fatalf("Failed to parse config.json: %v", err)
+	}
+
+	// Установка значения по умолчанию для FileDir, если оно не указано
+	if config.FileDir == "" {
+		config.FileDir = "./files"
+		log.Printf("FileDir not specified in config, using default: %s", config.FileDir)
 	}
 
 	// Load users from file
@@ -209,6 +256,7 @@ func main() {
 	http.HandleFunc("/openFile", openFileHandler)
 	http.HandleFunc("/saveFile", saveFileHandler)
 	http.HandleFunc("/game", gamePageHandler)
+	http.HandleFunc("/changeFileDir", changeFileDirHandler)
 	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
 	http.Handle("/images/", http.StripPrefix("/images/", http.FileServer(http.Dir("images"))))
 	http.HandleFunc("/files/", filesHandler)
@@ -267,12 +315,7 @@ func mainPageHandler(w http.ResponseWriter, r *http.Request) {
 	var currentUsername string
 	if cookie, err := r.Cookie("auth"); err == nil {
 		currentUsername = strings.Split(cookie.Value, ":")[0]
-		for _, user := range userStore.(*JSONUserStore).Users {
-			if user.Username == currentUsername {
-				isAdmin = user.IsAdmin
-				break
-			}
-		}
+		isAdmin = userStore.IsAdmin(currentUsername)
 	}
 
 	// Рендеринг страницы
@@ -281,11 +324,13 @@ func mainPageHandler(w http.ResponseWriter, r *http.Request) {
 		Files        []FileInfo
 		Username     string
 		IsAdmin      bool
+		FileDir      string
 	}{
 		IsAuthorized: isAuthorized,
 		Files:        fileInfos,
 		Username:     currentUsername,
 		IsAdmin:      isAdmin,
+		FileDir:      config.FileDir,
 	}
 
 	err = templates.ExecuteTemplate(w, "main.html", data)
@@ -765,4 +810,82 @@ func gamePageHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "Failed to render game page", http.StatusInternalServerError)
 	}
+}
+
+// Обработчик для изменения пути к папке files
+func changeFileDirHandler(w http.ResponseWriter, r *http.Request) {
+	// Проверяем, что запрос от админа
+	username, ok := r.Context().Value("username").(string)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	if !userStore.IsAdmin(username) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Получаем новый путь из формы
+	newPath := r.FormValue("file_dir")
+	if newPath == "" {
+		http.Error(w, "File directory path is required", http.StatusBadRequest)
+		return
+	}
+
+	// Проверяем, что путь существует или может быть создан
+	if _, err := os.Stat(newPath); os.IsNotExist(err) {
+		if err := os.MkdirAll(newPath, os.ModePerm); err != nil {
+			http.Error(w, fmt.Sprintf("Failed to create directory: %v", err), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Обновляем конфигурацию
+	config.FileDir = newPath
+
+	// Сохраняем обновленную конфигурацию в файл
+	configFile, err := os.OpenFile("config.json", os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to open config file: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer configFile.Close()
+
+	// Читаем текущую конфигурацию
+	var currentConfig map[string]interface{}
+	if err := json.NewDecoder(configFile).Decode(&currentConfig); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to parse current config: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Обновляем значение FileDir
+	currentConfig["file_dir"] = newPath
+
+	// Очищаем файл
+	if err := configFile.Truncate(0); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to truncate config file: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if _, err := configFile.Seek(0, 0); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to seek to beginning of file: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Записываем обновленную конфигурацию
+	encoder := json.NewEncoder(configFile)
+	encoder.SetIndent("", "    ")
+	if err := encoder.Encode(currentConfig); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to write updated config: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Возвращаем успешный ответ
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "File directory path updated to: %s", newPath)
 }

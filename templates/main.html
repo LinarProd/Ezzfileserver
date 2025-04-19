@@ -139,6 +139,18 @@
             <button type="button">Go to Game Page</button>
         </a>
     </div>
+    
+    {{if .IsAdmin}}
+    <div class="admin-panel">
+        <h2>Панель администратора</h2>
+        <form method="post" action="/changeFileDir">
+            <label for="file_dir">Путь к папке файлов:</label>
+            <input type="text" id="file_dir" name="file_dir" value="{{.FileDir}}" required />
+            <button type="submit">Изменить путь</button>
+        </form>
+    </div>
+    {{end}}
+    
     <form
       method="post"
       action="/upload"
